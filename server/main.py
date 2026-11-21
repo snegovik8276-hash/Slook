@@ -10,6 +10,8 @@ MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 SYSTEM = ("Ты SLOOK — персональный ИИ-помощник. Отвечай на языке пользователя, "
           "по делу и без выдумок. Если не уверен, так и скажи.")
 MAX_B64 = 14_000_000  # ~10 МБ файла
+GEMINI = "https://generativelanguage.googleapis.com/v1beta/models"
+TIMEOUT = httpx.Timeout(connect=15, read=60, write=30, pool=15)
 
 
 class M(BaseModel):
@@ -65,10 +67,10 @@ async def chat(req: Req, authorization: str = Header(default="")):
             contents[-1]["parts"].append({"inline_data": {"mime_type": a.mime, "data": a.data}})
 
     async def gen():
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:streamGenerateContent?alt=sse"
+        url = f"{GEMINI}/{MODEL}:streamGenerateContent?alt=sse"
         body = {"contents": contents, "systemInstruction": {"parts": [{"text": SYSTEM}]}}
         try:
-            async with httpx.AsyncClient(timeout=120) as client:
+            async with httpx.AsyncClient(timeout=TIMEOUT) as client:
                 async with client.stream("POST", url, json=body,
                                          headers={"x-goog-api-key": GEMINI_API_KEY}) as r:
                     if r.status_code != 200:
@@ -86,7 +88,43 @@ async def chat(req: Req, authorization: str = Header(default="")):
                             for p in cand.get("content", {}).get("parts", []):
                                 if "text" in p:
                                     yield line({"t": p["text"]})
-        except Exception as ex:  # сетевые ошибки показываем, а не прячем
-            yield line({"e": f"Ошибка сервера: {ex}"})
+        except httpx.TimeoutException as ex:
+            yield line({"e": f"Gemini не ответил за 60 секунд ({type(ex).__name__}). Попробуй ещё раз или смени модель."})
+        except Exception as ex:  # ошибки показываем, а не прячем
+            yield line({"e": f"Ошибка сервера ({type(ex).__name__}): {ex}"})
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+
+def check_token(token: str):
+    if not APP_TOKEN or token != APP_TOKEN:
+        raise HTTPException(401, "Неверный токен")
+
+
+@app.get("/models")
+async def models(token: str = ""):
+    check_token(token)
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.get(f"{GEMINI}?pageSize=200", headers={"x-goog-api-key": GEMINI_API_KEY})
+        if r.status_code != 200:
+            return {"status": r.status_code, "body": r.text[:500]}
+        names = [m["name"].replace("models/", "") for m in r.json().get("models", [])
+                 if "generateContent" in m.get("supportedGenerationMethods", [])]
+        return {"models": names}
+    except Exception as ex:
+        return {"error": type(ex).__name__, "detail": str(ex)}
+
+
+@app.get("/test")
+async def test(token: str = "", model: str = ""):
+    check_token(token)
+    m = model or MODEL
+    body = {"contents": [{"role": "user", "parts": [{"text": "Скажи привет одним словом"}]}]}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(45)) as c:
+            r = await c.post(f"{GEMINI}/{m}:generateContent", json=body,
+                             headers={"x-goog-api-key": GEMINI_API_KEY})
+        return {"model": m, "status": r.status_code, "body": r.text[:800]}
+    except Exception as ex:
+        return {"model": m, "error": type(ex).__name__, "detail": str(ex)}
